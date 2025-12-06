@@ -12,7 +12,7 @@
 using namespace std;
 
 #define PORT 12345
-#define SERVER_IP "10.62.45.117"
+#define SERVER_IP "10.217.12.117"
 
 atomic<bool> exit_flag(false);
 

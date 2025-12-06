@@ -118,7 +118,7 @@ bool recv_file(SOCKET s, const string& sender, const string& header) {
     int got = 0;
     string chunk;
 
- //progress bar and slowed one so it will get delayed for visible 
+ //progress bar to show progress, slowed down to make progress visible
 
     while (got < size) {
         if (!recv_frame(s, chunk)) break;
