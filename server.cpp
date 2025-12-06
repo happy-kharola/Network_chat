@@ -53,6 +53,9 @@ void broadcast(string sender, string msg, SOCKET exclude = INVALID_SOCKET) {
     }
 }
 
+
+
+
 // remove client from list
 void remove_client(SOCKET s) {
     lock_guard<mutex> lock(mtx_clients);
@@ -63,6 +66,25 @@ void remove_client(SOCKET s) {
         clients.erase(it);
     }
 }
+
+// for #kick
+void kick_user(const string& name) {
+    lock_guard<mutex> lock(mtx_clients);
+    for (auto& c : clients) {
+        if (c.name == name) {
+            send_frame(c.sock, "SERVER");
+            send_frame(c.sock, "You have been kicked by the server.");
+            closesocket(c.sock);
+            print_safe("Kicked: " + name);
+            broadcast("SERVER", name + " was kicked by the server.");
+            return;
+        }
+    }
+    print_safe("No client named '" + name + "' found.");
+}
+
+
+
 
 // handle one client
 void client_handler(SOCKET s, int id) {
@@ -133,20 +155,6 @@ void client_handler(SOCKET s, int id) {
 }
 
 
-void kick_user(const string& name) {
-    lock_guard<mutex> lock(mtx_clients);
-    for (auto& c : clients) {
-        if (c.name == name) {
-            send_frame(c.sock, "SERVER");
-            send_frame(c.sock, "You have been kicked by the server.");
-            closesocket(c.sock);
-            print_safe("Kicked: " + name);
-            broadcast("SERVER", name + " was kicked by the server.");
-            return;
-        }
-    }
-    print_safe("No client named '" + name + "' found.");
-}
 
 void forward_last_file() {
     if (last_file_path.empty()) {
