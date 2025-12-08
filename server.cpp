@@ -163,20 +163,26 @@ void forward_last_file() {
     }
 
     print_safe("Forwarding last file: " + last_file_name);
+    
+    // unamed scope to prevent mtx_clients mutex unlocked after the scope
+    // for broadcast() to lock again
+    {
+        lock_guard<mutex> lock(mtx_clients);
 
-    lock_guard<mutex> lock(mtx_clients);
+        for (auto& c : clients) {
+            if (c.name == last_file_sender) continue;
 
-    for (auto& c : clients) {
-        if (c.name == last_file_sender) continue;
-
-        // Add this — the client expects 2 frames first!
-        send_frame(c.sock, "SERVER");
+            // Add this — the client expects 2 frames first!
+            send_frame(c.sock, "SERVER");
         
-        // Then actually send the file data (adjust send_file to skip sending its own header)
-        send_file(c.sock, last_file_path);
-    }
+            // Then actually send the file data (adjust send_file to skip sending its own header)
+            send_file(c.sock, last_file_path);
+        
 
-    broadcast("SERVER", "Server forwarded the last received file.");
+        }
+    }
+    
+    broadcast("SERVER","Server forwarded the last received file.");
 }
 
 
