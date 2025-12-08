@@ -11,23 +11,116 @@ using namespace std;
 
 #define CHUNK_SIZE 20480
 
-// simple helper to send a message with its length first
-bool send_frame(SOCKET s, const string& msg) {
+// For confirming the packet is sent properly.
+// uses "total_sent" and keeps calling send until "total_sent" equals length.
+// false: if sent ruturn -1 or 0
+// true: data is sent
+// pre_conditions to work properly: length > 0, data not too big
+
+bool send_all(SOCKET s, const char* data, int length){
+    int total_sent = 0;
+
+    while( total_sent < length ){
+        int sent = send(s, data + total_sent, length - total_sent, 0);
+
+        if( sent == SOCKET_ERROR){
+            // something went wrong - network error
+            cerr << "Send failed: "<< WSAGetLastError() << endl;
+            return false;
+        }
+
+        if( sent == 0){
+            // conection closed
+            cerr << "Connection closed during send" << endl;
+            return false;
+        }
+    
+        total_sent += sent;
+    }
+
+    return true;
+    
+}
+
+
+bool recv_all(SOCKET s, char* buffer, int length){
+    int total_recv = 0;
+
+    while( total_recv < length){
+        int received = recv(s, buffer + total_recv, length - total_recv, 0);
+
+        if( received == SOCKET_ERROR){
+            //Network error
+            cerr << "Recv failed: " << WSAGetLastError <<endl;
+            return false;
+        }
+
+        if( received == 0){
+            // connection closed gracefully by other side
+            return false;
+        }
+
+        total_recv += received;
+    }
+
+    return true; // All bytes received successfully
+}
+
+
+bool send_frame(SOCKET s, const string& msg){
     int len = msg.size();
-    send(s, (char*)&len, sizeof(len), 0);    // send the length first
-    send(s, msg.c_str(), len, 0);            // send the actual message
+
+    // Validate size 
+    if( len < 0 || len > 100 * 1024 * 1024){ // 100MB max
+        cerr << "Message too large or invalid: " << len << endl;
+        return false;
+    }
+
+    // Send length 
+    if(!send_all(s, (char*)&len, sizeof(len))){
+        return false; // send all already printed error
+    }
+    
+    // Send mesg
+    if( len > 0){
+            if(!send_all(s, msg.c_str(), len)){
+            return false;
+    }
+    }
+
     return true;
 }
 
-// simple helper to receive a message (read length, then data)
-bool recv_frame(SOCKET s, string& out) {
-    int len = 0;
-    int r = recv(s, (char*)&len, sizeof(len), 0);
-    if (r <= 0) return false;
 
+
+bool recv_frame(SOCKET s, string& out){
+    int len = 0;
+    
+    // Receive the length
+    if(!recv_all(s, (char*)&len, sizeof(len))){
+        return false;    //connection lost or error
+    }
+
+    // Validate the length
+    if(len < 0 || len > 100 * 1024 * 1024){ //100MB max
+        cerr << "Invalid length received: "<< len << endl;
+        return false;    
+    }
+
+    // Handle empty messages
+    if( len == 0){
+        out.clear();
+        return true;
+    }
+    
+    // Receive the actual data
     out.resize(len);
-    recv(s, &out[0], len, 0);  // read the actual message
+    if(!recv_all(s, &out[0], len)){
+        return false;  // connection lost during data transfer
+    }
+
     return true;
+
 }
 
 // send a file in chunks
