@@ -14,9 +14,36 @@
 using namespace std;
 
 #define PORT 12345
-string last_file_path = "";
-string last_file_name = "";
-string last_file_sender = "";
+
+// Thread safe storage for last reveived file
+struct LastFile{
+    mutex mtx;
+    string path;
+    string name;
+    string sender;
+
+    //Thread-safe setter
+    void set(const string&p, const string &n, const string &s){
+        lock_guard<mutex> lock(mtx);
+        path = p;
+        name = n;
+        sender = s;
+    }
+
+    // Thread_safe getter - returns false if no file exists
+    bool get(string& p, string& n, string& s){
+        lock_guard<mutex> lock(mtx);
+        if(path.empty()) return false;
+        p = path;
+        n = name;
+        s = sender;
+        return true;
+    }
+
+
+};
+
+LastFile last_file; // single instance
 
 
 
@@ -133,9 +160,8 @@ void client_handler(SOCKET s, int id) {
             size_t slash = clean.find_last_of("/\\");
             if (slash != string::npos) clean = clean.substr(slash + 1);
 
-            last_file_sender = name;
-            last_file_name = clean;
-            last_file_path = "receivedfiles/received_" + clean;
+            // setting up the file name in lastfile for forward function.
+            last_file.set("receivedfiles/received_" + clean, clean, name);
 
 
             broadcast("SERVER", name + " sent a file: " + header.substr(0, header.find('|')));
@@ -157,12 +183,16 @@ void client_handler(SOCKET s, int id) {
 
 
 void forward_last_file() {
-    if (last_file_path.empty()) {
+    string path, name , sender;
+
+    //Get last file info
+    if(!last_file.get(path, name, sender)){
         print_safe("No file has been received yet.");
         return;
     }
 
-    print_safe("Forwarding last file: " + last_file_name);
+
+    print_safe("Forwarding last file: " + name);
     
     // unamed scope to prevent mtx_clients mutex unlocked after the scope
     // for broadcast() to lock again
@@ -170,19 +200,19 @@ void forward_last_file() {
         lock_guard<mutex> lock(mtx_clients);
 
         for (auto& c : clients) {
-            if (c.name == last_file_sender) continue;
+            if (c.name == sender ) continue;
 
             // Add this — the client expects 2 frames first!
             send_frame(c.sock, "SERVER");
         
             // Then actually send the file data (adjust send_file to skip sending its own header)
-            send_file(c.sock, last_file_path);
+            send_file(c.sock, path);
         
 
         }
     }
     
-    broadcast("SERVER","Server forwarded the last received file.");
+    broadcast("SERVER","Server forwarded the last received file: " + name);
 }
 
 
