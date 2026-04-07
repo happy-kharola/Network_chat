@@ -6,7 +6,7 @@
 #include <chrono>
 #include <thread>
 #include <iomanip>
-#include <filesystem>   // for auto-creating receivedfiles/ folder
+#include <filesystem>
 
 using namespace std;
 namespace fs = std::filesystem;
@@ -52,20 +52,17 @@ bool recv_all(SOCKET s, char* buffer, int length) {
 
 // -----------------------------------------------------------------------
 // send_frame / recv_frame  (length-prefixed framing)
-// FIX: use htonl/ntohl so byte order is consistent across machines
+// htonl/ntohl ensures byte order is consistent across machines
 // -----------------------------------------------------------------------
 
 bool send_frame(SOCKET s, const string& msg) {
-    // FIX: convert length to network byte order before sending
-    uint32_t net_len = htonl((uint32_t)msg.size());
-
-    if (msg.size() > 100 * 1024 * 1024) {   // 100 MB cap
+    if (msg.size() > 100 * 1024 * 1024) {
         cerr << "Message too large: " << msg.size() << endl;
         return false;
     }
 
+    uint32_t net_len = htonl((uint32_t)msg.size());
     if (!send_all(s, (char*)&net_len, sizeof(net_len))) return false;
-
     if (!msg.empty())
         if (!send_all(s, msg.c_str(), (int)msg.size())) return false;
 
@@ -74,13 +71,10 @@ bool send_frame(SOCKET s, const string& msg) {
 
 bool recv_frame(SOCKET s, string& out) {
     uint32_t net_len = 0;
-
     if (!recv_all(s, (char*)&net_len, sizeof(net_len))) return false;
 
-    // FIX: convert from network byte order back to host order
     uint32_t len = ntohl(net_len);
-
-    if (len > 100 * 1024 * 1024) {   // 100 MB cap
+    if (len > 100 * 1024 * 1024) {
         cerr << "Invalid length received: " << len << endl;
         return false;
     }
@@ -96,12 +90,13 @@ bool recv_frame(SOCKET s, string& out) {
 
 // -----------------------------------------------------------------------
 // send_file   (chunks + progress bar)
+// Always sends only the bare filename in the header, never the full path
 // -----------------------------------------------------------------------
 
 bool send_file(SOCKET s, const string& filename) {
     ifstream file(filename, ios::binary);
     if (!file.is_open()) {
-        cout << "Can't open file: " << filename << endl;
+        cout << "Cannot open file: " << filename << endl;
         return false;
     }
 
@@ -109,10 +104,7 @@ bool send_file(SOCKET s, const string& filename) {
     long long size = file.tellg();
     file.seekg(0, ios::beg);
 
-    // FIX: only send the bare filename in the header, not the full path
-    // so the progress bar and the saved filename are always clean
     string bare = fs::path(filename).filename().string();
-
     string header = bare + "|" + to_string(size);
     send_frame(s, "#sendfile " + header);
 
@@ -129,8 +121,7 @@ bool send_file(SOCKET s, const string& filename) {
         int percent  = (int)((100LL * sent) / size);
         int barWidth = 40;
         int filled   = (barWidth * percent) / 100;
-
-        string bar = "[" + string(filled, '#') + string(barWidth - filled, '-') + "]";
+        string bar   = "[" + string(filled, '#') + string(barWidth - filled, '-') + "]";
 
         double sentMB = sent / (1024.0 * 1024.0);
         double sizeMB = size / (1024.0 * 1024.0);
@@ -139,18 +130,17 @@ bool send_file(SOCKET s, const string& filename) {
              << bar << " " << percent << "% "
              << "(" << fixed << setprecision(2) << sentMB << " MB / "
              << sizeMB << " MB)" << flush;
-
         cout << "\033[F";
     }
 
-    cout << endl << "\n\n Upload complete!" << endl << endl;
+    cout << endl << "\n\n Transfer complete: " << bare << endl << endl;
     return true;
 }
 
 
 // -----------------------------------------------------------------------
 // recv_file   (reassemble chunks + progress bar)
-// NEW: auto-creates receivedfiles/ if it doesn't exist
+// Auto-creates receivedfiles/ if it does not exist
 // -----------------------------------------------------------------------
 
 bool recv_file(SOCKET s, const string& sender, const string& header) {
@@ -158,14 +148,11 @@ bool recv_file(SOCKET s, const string& sender, const string& header) {
     if (pos == string::npos) return false;
 
     string name = header.substr(0, pos);
-
-    // Strip any path the sender might have included
     size_t slash = name.find_last_of("/\\");
     if (slash != string::npos) name = name.substr(slash + 1);
 
     long long size = stoll(header.substr(pos + 1));
 
-    // NEW: auto-create the output folder so the app never crashes on a missing directory
     fs::create_directories("receivedfiles");
 
     ofstream out("receivedfiles/received_" + name, ios::binary);
@@ -185,8 +172,7 @@ bool recv_file(SOCKET s, const string& sender, const string& header) {
         int percent  = (int)((100LL * got) / size);
         int barWidth = 40;
         int filled   = (barWidth * percent) / 100;
-
-        string bar = "[" + string(filled, '#') + string(barWidth - filled, '-') + "]";
+        string bar   = "[" + string(filled, '#') + string(barWidth - filled, '-') + "]";
 
         double gotMB  = got  / (1024.0 * 1024.0);
         double sizeMB = size / (1024.0 * 1024.0);
@@ -195,12 +181,11 @@ bool recv_file(SOCKET s, const string& sender, const string& header) {
              << bar << " " << percent << "% "
              << "(" << fixed << setprecision(2) << gotMB << " MB / "
              << sizeMB << " MB)" << flush;
-
         cout << "\033[F";
     }
 
-    cout << "\nDownload complete!\n";
-    cout << "Saved at: receivedfiles/received_" << name << "\n\n";
+    cout << "\nTransfer complete.\n";
+    cout << "Saved: receivedfiles/received_" << name << "\n\n";
     cout << "--------------------------------------------------\n";
 
     return true;

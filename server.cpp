@@ -31,11 +31,11 @@ bool Initialize() {
 
 
 // -----------------------------------------------------------------------
-// LastFile  — thread-safe storage for the most recently received file
+// LastFile — thread-safe storage for the most recently received file
 // -----------------------------------------------------------------------
 
 struct LastFile {
-    mutex mtx;
+    mutex  mtx;
     string path, name, sender;
 
     void set(const string& p, const string& n, const string& s) {
@@ -77,7 +77,7 @@ void print_safe(const string& msg) {
     cout << msg << endl;
 }
 
-// NEW: get local LAN IP to display at startup so classmates know what to type
+// Resolves and returns the machine's local LAN IP address
 string get_local_ip() {
     char hostname[256];
     if (gethostname(hostname, sizeof(hostname)) == SOCKET_ERROR) return "unknown";
@@ -92,7 +92,6 @@ string get_local_ip() {
         sockaddr_in* addr = (sockaddr_in*)p->ai_addr;
         if (inet_ntop(AF_INET, &addr->sin_addr, buf, sizeof(buf))) {
             ip = buf;
-            // Prefer a 192.168.x.x or 10.x.x.x address (typical LAN)
             if (ip.rfind("192.168.", 0) == 0 || ip.rfind("10.", 0) == 0) break;
         }
     }
@@ -100,7 +99,7 @@ string get_local_ip() {
     return ip;
 }
 
-// broadcast a message to all clients except the excluded socket
+// Broadcast a message to all connected clients, optionally excluding one socket
 void broadcast(const string& sender, const string& msg, SOCKET exclude = INVALID_SOCKET) {
     lock_guard<mutex> lock(mtx_clients);
     for (auto& c : clients) {
@@ -110,14 +109,14 @@ void broadcast(const string& sender, const string& msg, SOCKET exclude = INVALID
     }
 }
 
-// NEW: check if a username is already taken (call with mtx_clients held)
+// Returns true if the given username is already registered (call without holding mtx_clients)
 bool name_taken(const string& name) {
     for (auto& c : clients)
         if (c.name == name) return true;
     return false;
 }
 
-// remove client from the list and close its socket
+// Cleanly removes a client from the list and closes its socket
 void remove_client(SOCKET s) {
     lock_guard<mutex> lock(mtx_clients);
     auto it = find_if(clients.begin(), clients.end(), [&](Client& c) { return c.sock == s; });
@@ -129,8 +128,8 @@ void remove_client(SOCKET s) {
     }
 }
 
-// FIX: kick_user — collect socket first, release lock, then act
-// avoids deadlock with remove_client and broadcast both trying to lock mtx_clients
+// Disconnects a client by name — collects socket first, releases lock before acting
+// to avoid deadlock with remove_client and broadcast
 void kick_user(const string& name) {
     SOCKET target = INVALID_SOCKET;
     {
@@ -140,25 +139,24 @@ void kick_user(const string& name) {
     }
 
     if (target == INVALID_SOCKET) {
-        print_safe("No client named '" + name + "' found.");
+        print_safe("[Server] No connected user named '" + name + "'.");
         return;
     }
 
     send_frame(target, "SERVER");
-    send_frame(target, "You have been kicked by the server.");
-
+    send_frame(target, "You have been disconnected by the server.");
     remove_client(target);
-    broadcast("SERVER", name + " was kicked by the server.");
-    print_safe("Kicked: " + name);
+    broadcast("SERVER", name + " was disconnected by the server.");
+    print_safe("[Server] Kicked: " + name);
 }
 
 
 // -----------------------------------------------------------------------
-// #list — send current online users to one client
+// #list — respond to a client's #list request with the online user list
 // -----------------------------------------------------------------------
 
 void send_user_list(SOCKET s) {
-    string list = "Online users: ";
+    string list = "Connected users: ";
     {
         lock_guard<mutex> lock(mtx_clients);
         for (size_t i = 0; i < clients.size(); i++) {
@@ -172,22 +170,20 @@ void send_user_list(SOCKET s) {
 
 
 // -----------------------------------------------------------------------
-// #forward — resend last received file to all other clients
-// FIX: collect sockets BEFORE locking for file send, so we don't hold
-//      mtx_clients across a potentially large file transfer
-// FIX: correct frame order — client expects sender frame then #sendfile frame
+// #forward — re-send the last received file to all clients except original sender
+// Sockets are collected before the send to avoid holding mtx_clients
+// during a potentially large file transfer
 // -----------------------------------------------------------------------
 
 void forward_last_file() {
     string path, name, sender;
     if (!last_file.get(path, name, sender)) {
-        print_safe("No file has been received yet.");
+        print_safe("[Server] No file has been received yet.");
         return;
     }
 
-    print_safe("Forwarding last file: " + name);
+    print_safe("[Server] Forwarding: " + name + " (originally from " + sender + ")");
 
-    // Collect target sockets without holding the lock during the actual send
     vector<SOCKET> targets;
     {
         lock_guard<mutex> lock(mtx_clients);
@@ -195,26 +191,91 @@ void forward_last_file() {
             if (c.name != sender) targets.push_back(c.sock);
     }
 
-    // FIX: send proper framing — sender frame, then #sendfile header, then chunks
-    // This matches exactly what recv_thread on the client expects
     for (SOCKET sock : targets) {
-        send_frame(sock, "SERVER");                                         // frame 1: sender name
-        send_file(sock, path);                                              // frame 2+: #sendfile header + chunks
+        send_frame(sock, "SERVER");
+        send_file(sock, path);
     }
 
-    broadcast("SERVER", "Server forwarded the last received file: " + name);
+    broadcast("SERVER", "Server forwarded file: " + name);
 }
 
 
 // -----------------------------------------------------------------------
-// client_handler — runs in its own thread per connected client
-// FIX: duplicate username rejection with a negotiation loop
+// server_send_file_all — send a file from the server to all connected clients
+// -----------------------------------------------------------------------
+
+void server_send_file_all(const string& filepath) {
+    if (!fs::exists(filepath)) {
+        print_safe("[Server] File not found: " + filepath);
+        return;
+    }
+
+    string bare = fs::path(filepath).filename().string();
+    print_safe("[Server] Sending " + bare + " to all connected clients...");
+
+    vector<SOCKET> targets;
+    {
+        lock_guard<mutex> lock(mtx_clients);
+        for (auto& c : clients)
+            targets.push_back(c.sock);
+    }
+
+    if (targets.empty()) {
+        print_safe("[Server] No clients connected.");
+        return;
+    }
+
+    for (SOCKET sock : targets) {
+        send_frame(sock, "SERVER");
+        send_file(sock, filepath);
+    }
+
+    broadcast("SERVER", "Server distributed file: " + bare);
+    print_safe("[Server] File sent to all clients: " + bare);
+}
+
+
+// -----------------------------------------------------------------------
+// server_send_file_one — send a file from the server to a single named client
+// -----------------------------------------------------------------------
+
+void server_send_file_one(const string& target_name, const string& filepath) {
+    if (!fs::exists(filepath)) {
+        print_safe("[Server] File not found: " + filepath);
+        return;
+    }
+
+    SOCKET target = INVALID_SOCKET;
+    {
+        lock_guard<mutex> lock(mtx_clients);
+        for (auto& c : clients)
+            if (c.name == target_name) { target = c.sock; break; }
+    }
+
+    if (target == INVALID_SOCKET) {
+        print_safe("[Server] No connected user named '" + target_name + "'.");
+        return;
+    }
+
+    string bare = fs::path(filepath).filename().string();
+    print_safe("[Server] Sending " + bare + " to " + target_name + "...");
+
+    send_frame(target, "SERVER");
+    send_file(target, filepath);
+
+    print_safe("[Server] File sent to " + target_name + ": " + bare);
+}
+
+
+// -----------------------------------------------------------------------
+// client_handler — per-client thread
+// Handles username negotiation, messaging, and file receive
 // -----------------------------------------------------------------------
 
 void client_handler(SOCKET s, int id) {
     string name;
 
-    // NEW: reject duplicate usernames — loop until client sends a unique name
+    // Username negotiation — reject duplicates until a unique name is provided
     while (true) {
         if (!recv_frame(s, name)) { remove_client(s); return; }
 
@@ -225,72 +286,62 @@ void client_handler(SOCKET s, int id) {
         }
 
         if (taken) {
-            // Tell client to pick another name
             send_frame(s, "SERVER");
             send_frame(s, "#nametaken");
         } else {
-            // Confirm the name is accepted
             send_frame(s, "SERVER");
             send_frame(s, "#nameok");
             break;
         }
     }
 
-    // Register the accepted name
     {
         lock_guard<mutex> lock(mtx_clients);
         for (auto& c : clients)
             if (c.sock == s) c.name = name;
     }
 
-    print_safe(name + " joined the chat!");
-    broadcast("SERVER", name + " joined the chat.", s);
+    print_safe("[+] " + name + " connected  (id=" + to_string(id) + ")");
+    broadcast("SERVER", name + " joined the session.", s);
 
     while (true) {
         string msg;
         if (!recv_frame(s, msg)) break;
 
-        // --- exit ---
         if (msg == "#exit") {
-            broadcast("SERVER", name + " left the chat.");
-            print_safe(name + " disconnected.");
+            broadcast("SERVER", name + " left the session.");
+            print_safe("[-] " + name + " disconnected.");
             remove_client(s);
             return;
         }
 
-        // --- list ---
         if (msg == "#list") {
             send_user_list(s);
             continue;
         }
 
-        // --- file transfer ---
         if (msg.rfind("#sendfile ", 0) == 0) {
             string header = msg.substr(10);
             string clean  = header.substr(0, header.find('|'));
-
-            // Strip path separators from display name
-            size_t slash = clean.find_last_of("/\\");
+            size_t slash  = clean.find_last_of("/\\");
             if (slash != string::npos) clean = clean.substr(slash + 1);
 
             print_safe("\n--------------------------------------------------");
-            print_safe(" FILE FROM : " + name);
-            print_safe(" FILE NAME : " + clean);
+            print_safe(" Incoming file from : " + name);
+            print_safe(" File               : " + clean);
             print_safe("--------------------------------------------------");
 
             recv_file(s, name, header);
-
             last_file.set("receivedfiles/received_" + clean, clean, name);
             broadcast("SERVER", name + " sent a file: " + clean, s);
             continue;
         }
 
-        // --- normal message ---
         print_safe(name + ": " + msg);
-        broadcast(name, msg, s);  // NOTE: excludes sender — fixes double-print on client
+        broadcast(name, msg, s);
     }
 
-    broadcast("SERVER", name + " left the chat.");
+    broadcast("SERVER", name + " left the session.");
     remove_client(s);
 }
 
@@ -301,32 +352,30 @@ void client_handler(SOCKET s, int id) {
 
 int main() {
     if (!Initialize()) {
-        cout << "Failed to initialize Winsock!\n";
+        cout << "Winsock initialization failed.\n";
         return 1;
     }
 
-    // NEW: auto-create receivedfiles/ folder on server side too
     fs::create_directories("receivedfiles");
 
-    // NEW: allow runtime port override before starting
-    cout << "===============================================\n";
-    cout << "         LAN Chat Server\n";
-    cout << "===============================================\n";
+    cout << "================================================\n";
+    cout << "           LAN Chat Server\n";
+    cout << "================================================\n";
     cout << "Default port: " << DEFAULT_PORT << "\n";
-    cout << "Press ENTER to use default, or type a port number: ";
+    cout << "Press Enter to use default, or enter a port number: ";
     string port_input;
     getline(cin, port_input);
     if (!port_input.empty()) {
         try { SERVER_PORT = stoi(port_input); }
         catch (...) {
-            cout << "Invalid port, using default " << DEFAULT_PORT << "\n";
+            cout << "Invalid input — using default port " << DEFAULT_PORT << "\n";
             SERVER_PORT = DEFAULT_PORT;
         }
     }
 
     SOCKET listenSock = socket(AF_INET, SOCK_STREAM, 0);
     if (listenSock == INVALID_SOCKET) {
-        cout << "Socket creation failed!\n";
+        cout << "Socket creation failed.\n";
         WSACleanup();
         return 1;
     }
@@ -337,67 +386,127 @@ int main() {
     InetPton(AF_INET, _T("0.0.0.0"), &addr.sin_addr);
 
     if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        cout << "Bind failed! Port " << SERVER_PORT << " may already be in use.\n";
+        cout << "Bind failed. Port " << SERVER_PORT << " may already be in use.\n";
         closesocket(listenSock);
         WSACleanup();
         return 1;
     }
 
     if (listen(listenSock, SOMAXCONN) == SOCKET_ERROR) {
-        cout << "Listen failed!\n";
+        cout << "Listen failed.\n";
         closesocket(listenSock);
         WSACleanup();
         return 1;
     }
 
-    // NEW: display local IP so classmates know what to connect to
     string local_ip = get_local_ip();
 
-    cout << "\n===============================================\n";
-    cout << "  Server started!\n";
-    cout << "  IP   : " << local_ip << "\n";
-    cout << "  Port : " << SERVER_PORT << "\n";
-    cout << "  Tell classmates to connect to: " << local_ip << ":" << SERVER_PORT << "\n";
-    cout << "===============================================\n\n";
+    cout << "\n================================================\n";
+    cout << "  Status  : Listening\n";
+    cout << "  Address : " << local_ip << ":" << SERVER_PORT << "\n";
+    cout << "================================================\n\n";
 
-    cout << "Server Commands:\n";
-    cout << "  <message>          -> Broadcast a message to all clients\n";
-    cout << "  #kick <name>       -> Kick a client by name\n";
-    cout << "  #forward           -> Forward last received file to all clients\n";
-    cout << "  #list              -> Show all connected users\n";
-    cout << "--------------------------------------------------\n\n";
+    cout << "Commands\n";
+    cout << "  <message>\n";
+    cout << "    Broadcast a text message to all connected clients.\n\n";
 
-    // Thread to read server console input
+    cout << "  #kick <name>\n";
+    cout << "    Disconnect a user by name.  e.g.  #kick Ali\n\n";
+
+    cout << "  #list\n";
+    cout << "    Display all currently connected users.\n\n";
+
+    cout << "  #forward\n";
+    cout << "    Re-send the last received file to all clients.\n\n";
+
+    cout << "  #sendfile <path>\n";
+    cout << "    Send a file to ALL connected clients.\n";
+    cout << "    e.g.  #sendfile notes.pdf\n";
+    cout << "    e.g.  #sendfile C:\\Users\\You\\Desktop\\sheet.xlsx\n\n";
+
+    cout << "  #sendfile <name> <path>\n";
+    cout << "    Send a file to ONE specific client by name.\n";
+    cout << "    e.g.  #sendfile Ali notes.pdf\n";
+    cout << "    e.g.  #sendfile Sara C:\\files\\lecture.pdf\n\n";
+
+    cout << "------------------------------------------------\n\n";
+
+    // Server console input thread
     thread server_input([]() {
         string msg;
         while (true) {
             getline(cin, msg);
             if (msg.empty()) continue;
 
+            // #kick <name>
             if (msg.rfind("#kick ", 0) == 0) {
                 kick_user(msg.substr(6));
                 continue;
             }
 
+            // #forward
             if (msg == "#forward") {
                 forward_last_file();
                 continue;
             }
 
+            // #list
             if (msg == "#list") {
-                // Print to server console
                 lock_guard<mutex> lock(mtx_clients);
-                cout << "Online (" << clients.size() << "): ";
-                for (size_t i = 0; i < clients.size(); i++) {
-                    cout << clients[i].name;
-                    if (i + 1 < clients.size()) cout << ", ";
+                if (clients.empty()) {
+                    cout << "[Server] No clients connected.\n";
+                } else {
+                    cout << "[Server] Connected (" << clients.size() << "): ";
+                    for (size_t i = 0; i < clients.size(); i++) {
+                        cout << clients[i].name;
+                        if (i + 1 < clients.size()) cout << ", ";
+                    }
+                    cout << "\n";
                 }
-                cout << endl;
                 continue;
             }
 
+            // #sendfile <name> <path>  — send to one specific client
+            // #sendfile <path>         — send to all clients
+            if (msg.rfind("#sendfile ", 0) == 0) {
+                string arg = msg.substr(10);   // everything after "#sendfile "
+
+                // Check if first token matches a connected client name
+                // by scanning for a space and testing the first word
+                SOCKET found_sock = INVALID_SOCKET;
+                string found_name;
+                string remainder;
+
+                size_t space = arg.find(' ');
+                if (space != string::npos) {
+                    string first_word = arg.substr(0, space);
+                    string rest       = arg.substr(space + 1);
+                    {
+                        lock_guard<mutex> lock(mtx_clients);
+                        for (auto& c : clients) {
+                            if (c.name == first_word) {
+                                found_sock = c.sock;
+                                found_name = c.name;
+                                remainder  = rest;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (found_sock != INVALID_SOCKET) {
+                    // First word was a valid client name — send to that one client
+                    server_send_file_one(found_name, remainder);
+                } else {
+                    // No client name match — treat entire arg as filepath, send to all
+                    server_send_file_all(arg);
+                }
+                continue;
+            }
+
+            // Normal broadcast message
             broadcast("SERVER", msg);
-            print_safe("SERVER (you): " + msg);
+            print_safe("SERVER: " + msg);
         }
     });
     server_input.detach();
@@ -413,8 +522,6 @@ int main() {
             clients.back().th = thread(client_handler, clientSock, id);
             clients.back().th.detach();
         }
-
-        print_safe("Client connected (id=" + to_string(id) + ")");
     }
 
     closesocket(listenSock);

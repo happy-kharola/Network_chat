@@ -24,9 +24,8 @@ bool Initialize() {
 
 
 // -----------------------------------------------------------------------
-// recv_thread — handles all incoming messages from server
-// FIX: server now excludes sender from broadcast, so we no longer
-//      receive our own messages back — double-print is gone
+// recv_thread — handles all incoming frames from the server
+// Server excludes the sender from broadcast so own messages never echo back
 // -----------------------------------------------------------------------
 
 void recv_thread(SOCKET s, const string& name) {
@@ -35,7 +34,6 @@ void recv_thread(SOCKET s, const string& name) {
         if (!recv_frame(s, sender)) break;
         if (!recv_frame(s, msg))   break;
 
-        // File incoming
         if (msg.rfind("#sendfile ", 0) == 0) {
             cout << "\n";
             recv_file(s, sender, msg.substr(10));
@@ -43,9 +41,8 @@ void recv_thread(SOCKET s, const string& name) {
             continue;
         }
 
-        // Server notification
         if (sender == "SERVER") {
-            cout << "\n## SERVER ## " << msg << "\n\n";
+            cout << "\n[SERVER] " << msg << "\n\n";
         } else {
             cout << "\n[ " << sender << " ]: " << msg << "\n\n";
         }
@@ -57,7 +54,7 @@ void recv_thread(SOCKET s, const string& name) {
 
 
 // -----------------------------------------------------------------------
-// send_thread — handles user input and sends to server
+// send_thread — reads user input and sends to the server
 // -----------------------------------------------------------------------
 
 void send_thread(SOCKET s) {
@@ -65,18 +62,15 @@ void send_thread(SOCKET s) {
     while (!exit_flag) {
         cout << " " << flush;
         getline(cin, line);
-
-        // Clear the typed line from terminal
         cout << "\x1b[A" << "\x1b[2K";
 
         if (exit_flag) break;
         if (line.empty()) continue;
 
-        // File send
         if (line.rfind("#sendfile ", 0) == 0) {
             string filename = line.substr(10);
             if (!fs::exists(filename)) {
-                cout << "## File not found: " << filename << "\n\n";
+                cout << "[Error] File not found: " << filename << "\n\n";
                 continue;
             }
             cout << "[ YOU ]: Sending file: " << fs::path(filename).filename().string() << "\n\n";
@@ -84,14 +78,12 @@ void send_thread(SOCKET s) {
             continue;
         }
 
-        // Exit
         if (line == "#exit") {
             send_frame(s, "#exit");
             exit_flag = true;
             break;
         }
 
-        // Normal message — print locally then send
         cout << "[ YOU ]: " << line << "\n\n";
         send_frame(s, line);
     }
@@ -104,48 +96,45 @@ void send_thread(SOCKET s) {
 
 int main() {
     if (!Initialize()) {
-        cout << "Winsock init failed.\n";
+        cout << "Winsock initialization failed.\n";
         return 1;
     }
 
-    // NEW: auto-create receivedfiles/ folder on client side
     fs::create_directories("receivedfiles");
 
-    cout << "\n===============================================\n";
-    cout << "         LAN Chat Client\n";
-    cout << "===============================================\n\n";
+    cout << "\n================================================\n";
+    cout << "            LAN Chat Client\n";
+    cout << "================================================\n\n";
 
-    // NEW: ask for server IP at runtime instead of hardcoding it
+    cout << "Server IP address: ";
     string server_ip;
-    cout << "Enter server IP (ask whoever is running the server): ";
     getline(cin, server_ip);
     if (server_ip.empty()) {
-        cout << "No IP entered. Exiting.\n";
+        cout << "No address entered. Exiting.\n";
         WSACleanup();
         return 1;
     }
 
-    // NEW: optional port override
     int port = DEFAULT_PORT;
-    cout << "Enter port (press ENTER for default " << DEFAULT_PORT << "): ";
+    cout << "Port (press Enter for default " << DEFAULT_PORT << "): ";
     string port_input;
     getline(cin, port_input);
     if (!port_input.empty()) {
         try { port = stoi(port_input); }
         catch (...) {
-            cout << "Invalid port, using default.\n";
+            cout << "Invalid input — using default port.\n";
             port = DEFAULT_PORT;
         }
     }
 
     SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
     if (s == INVALID_SOCKET) {
-        cout << "Socket creation failed!\n";
+        cout << "Socket creation failed.\n";
         WSACleanup();
         return 1;
     }
 
-    // NEW: connection timeout — fail in ~5 seconds instead of hanging for 20+
+    // 5-second connection timeout — fail fast instead of hanging
     DWORD timeout_ms = 5000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout_ms, sizeof(timeout_ms));
 
@@ -163,60 +152,67 @@ int main() {
     cout << "\nConnecting to " << server_ip << ":" << port << " ...\n";
 
     if (connect(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        cout << "Could not connect to server!\n";
-        cout << "  - Make sure the server is running.\n";
-        cout << "  - Double-check the IP address.\n";
-        cout << "  - Check that port " << port << " is not blocked by firewall.\n";
+        cout << "\nConnection failed.\n";
+        cout << "  - Verify the server is running.\n";
+        cout << "  - Verify the IP address is correct.\n";
+        cout << "  - Ensure both devices are on the same network.\n";
+        cout << "  - Check that port " << port << " is not blocked by a firewall.\n";
         closesocket(s);
         WSACleanup();
         return 1;
     }
 
-    // Remove the receive timeout after connecting — normal chat has no timeout
+    // Remove receive timeout after connecting — normal chat has no timeout
     DWORD no_timeout = 0;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&no_timeout, sizeof(no_timeout));
 
-    cout << "Connected!\n\n";
+    cout << "Connected.\n\n";
 
-    // NEW: username negotiation with duplicate rejection
+    // Username negotiation — retry if name is already taken
     string name;
     while (true) {
-        cout << "Enter your name: ";
+        cout << "Enter username: ";
         getline(cin, name);
         if (name.empty()) name = "Anonymous";
 
         send_frame(s, name);
 
-        // Wait for server response
         string resp_sender, resp_msg;
         if (!recv_frame(s, resp_sender) || !recv_frame(s, resp_msg)) {
-            cout << "Lost connection during name setup.\n";
+            cout << "Connection lost during setup.\n";
             closesocket(s);
             WSACleanup();
             return 1;
         }
 
         if (resp_msg == "#nameok") {
-            cout << "Name accepted!\n";
             break;
         } else if (resp_msg == "#nametaken") {
-            cout << "That name is already taken. Please choose another.\n";
-        } else {
-            // Unexpected message — just proceed
-            break;
+            cout << "Username already in use. Please choose another.\n";
         }
     }
 
-    cout << "\n===============================================\n";
-    cout << " Welcome, " << name << "!\n";
-    cout << "===============================================\n\n";
+    cout << "\n================================================\n";
+    cout << "  Logged in as: " << name << "\n";
+    cout << "================================================\n\n";
 
-    cout << "Commands:\n";
-    cout << "  <message>                  -> Send a message to everyone\n";
-    cout << "  #sendfile <path>           -> Send a file\n";
-    cout << "  #list                      -> See who is online\n";
-    cout << "  #exit                      -> Leave the chat\n";
-    cout << "--------------------------------------------------\n\n";
+    cout << "Commands\n";
+    cout << "  <message>\n";
+    cout << "    Send a text message to everyone.\n\n";
+
+    cout << "  #sendfile <path>\n";
+    cout << "    Send a file to the server.\n";
+    cout << "    e.g.  #sendfile notes.pdf\n";
+    cout << "    e.g.  #sendfile C:\\Users\\You\\Desktop\\assignment.zip\n\n";
+
+    cout << "  #list\n";
+    cout << "    Show all currently connected users.\n\n";
+
+    cout << "  #exit\n";
+    cout << "    Disconnect and close the client.\n\n";
+
+    cout << "  Received files are saved to: receivedfiles\\\n";
+    cout << "------------------------------------------------\n\n";
 
     thread t_recv(recv_thread, s, name);
     thread t_send(send_thread, s);
@@ -227,6 +223,6 @@ int main() {
     if (t_recv.joinable()) t_recv.join();
 
     WSACleanup();
-    cout << "\nSocket closed. Goodbye!\n";
+    cout << "\nDisconnected. Goodbye.\n";
     return 0;
 }
