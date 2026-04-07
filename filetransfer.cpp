@@ -51,7 +51,7 @@ bool recv_all(SOCKET s, char* buffer, int length){
 
         if( received == SOCKET_ERROR){
             //Network error
-            cerr << "Recv failed: " << WSAGetLastError <<endl;
+            cerr << "Recv failed: " << WSAGetLastError() <<endl;
             return false;
         }
 
@@ -132,7 +132,7 @@ bool send_file(SOCKET s, const string& filename) {
     }
 
     file.seekg(0, ios::end);
-    int size = file.tellg();
+    long long size = file.tellg();
     file.seekg(0, ios::beg);
 
     string header = filename + "|" + to_string(size);
@@ -141,7 +141,7 @@ bool send_file(SOCKET s, const string& filename) {
     
 
     char buffer[CHUNK_SIZE];
-    int sent = 0;
+    long long sent = 0;
 
 // for progress bar it also delay a lil to make progress visible
 
@@ -152,7 +152,7 @@ bool send_file(SOCKET s, const string& filename) {
         sent += count;
 
         // percentage
-        int percent = (100 * sent) / size;
+        int percent =(int)((100LL * sent) / size) ;
 
         // progress bar width
         int barWidth = 40;
@@ -169,13 +169,13 @@ bool send_file(SOCKET s, const string& filename) {
         double sentMB = sent / (1024.0 * 1024.0);
         double sizeMB = size / (1024.0 * 1024.0);
 
-        cout << "\rUploading " << filename << "\n"
+        cout << "\rUploading " << filename << " "
             << bar << " " << percent << "% "
             << "(" << fixed << setprecision(2) << sentMB << " MB / "
             << sizeMB << " MB)" << flush;
 
         // slow down animation (20ms)
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        // std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
         // move cursor up 1 line so bar overwrites properly
         cout << "\033[F";
@@ -199,7 +199,7 @@ bool recv_file(SOCKET s, const string& sender, const string& header) {
     size_t slash = name.find_last_of("/\\");
     if (slash != string::npos) name = name.substr(slash + 1);
 
-    int size = stoi(header.substr(pos + 1));
+    long long size = stoll(header.substr(pos + 1));
 
     
 
@@ -208,7 +208,7 @@ bool recv_file(SOCKET s, const string& sender, const string& header) {
 
     if (!out.is_open()) return false;
 
-    int got = 0;
+    long long got = 0; // used long long as 1 gb wasn't fitting in int.
     string chunk;
 
  //progress bar to show progress, slowed down to make progress visible
@@ -220,7 +220,7 @@ bool recv_file(SOCKET s, const string& sender, const string& header) {
         got += chunk.size();
 
         // percentage
-        int percent = (100 * got) / size;
+        int percent = (int)((100LL * got) / size);
 
         // progress bar width
         int barWidth = 40;
@@ -235,13 +235,13 @@ bool recv_file(SOCKET s, const string& sender, const string& header) {
         double gotMB = got / (1024.0 * 1024.0);
         double sizeMB = size / (1024.0 * 1024.0);
 
-        cout << "\rReceiving " << name << " from " << sender << "\n"
+        cout << "\rReceiving " << name << " from " << sender << " "
             << bar << " " << percent << "% "
             << "(" << fixed << setprecision(2) << gotMB << " MB / "
             << sizeMB << " MB)" << flush;
 
         // slow animation (20ms)
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        // std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
         // move cursor up 1 line
         cout << "\033[F";

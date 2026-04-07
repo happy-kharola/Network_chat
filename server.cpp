@@ -15,6 +15,11 @@ using namespace std;
 
 #define PORT 12345
 
+bool Initialize() {
+    WSADATA data;
+    return WSAStartup(MAKEWORD(2,2), &data) == 0;
+}
+
 // Thread safe storage for last reveived file
 struct LastFile{
     mutex mtx;
@@ -47,6 +52,7 @@ LastFile last_file; // single instance
 
 
 
+
 struct Client {
     int id;
     string name;
@@ -58,10 +64,7 @@ vector<Client> clients;
 mutex mtx_cout, mtx_clients;
 int next_id = 1;
 
-bool Initialize() {
-    WSADATA data;
-    return WSAStartup(MAKEWORD(2,2), &data) == 0;
-}
+
 
 // safe console printing
 void print_safe(string msg ) {
@@ -88,6 +91,7 @@ void remove_client(SOCKET s) {
     lock_guard<mutex> lock(mtx_clients);
     auto it = find_if(clients.begin(), clients.end(), [&](Client &c){ return c.sock == s; });
     if (it != clients.end()) {
+        shutdown(s,SD_SEND );
         closesocket(it->sock);
         if (it->th.joinable()) it->th.detach();
         clients.erase(it);
@@ -96,18 +100,42 @@ void remove_client(SOCKET s) {
 
 // for #kick
 void kick_user(const string& name) {
-    lock_guard<mutex> lock(mtx_clients);
-    for (auto& c : clients) {
-        if (c.name == name) {
-            send_frame(c.sock, "SERVER");
-            send_frame(c.sock, "You have been kicked by the server.");
-            closesocket(c.sock);
-            print_safe("Kicked: " + name);
-            broadcast("SERVER", name + " was kicked by the server.");
-            return;
+
+    SOCKET s = INVALID_SOCKET;
+    {
+        lock_guard<mutex> lock(mtx_clients);
+        for(auto& c: clients){
+            if(c.name == name){
+                s = c.sock;
+            }
         }
     }
-    print_safe("No client named '" + name + "' found.");
+
+    if( s == INVALID_SOCKET){
+        print_safe("No client name " + name + " found.");
+        return;
+    }
+
+    send_frame(s, "SERVER");
+    send_frame(s, "You have been kicked by the server.");
+    remove_client(s);
+    print_safe("Kicked:" + name);
+    broadcast("SERVER", name + " was kicked by the server.");
+    
+
+
+
+    // for (auto& c : clients) {
+    //     if (c.name == name) {
+    //         send_frame(c.sock, "SERVER");
+    //         send_frame(c.sock, "You have been kicked by the server.");
+    //         closesocket(c.sock);
+    //         print_safe("Kicked: " + name);
+    //         broadcast("SERVER", name + " was kicked by the server.");
+    //         return;
+    //     }
+    // }
+    //print_safe("No client named '" + name + "' found.");
 }
 
 

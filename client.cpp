@@ -46,6 +46,8 @@ void send_thread(SOCKET s) {
         cout << " " << flush;
         getline(cin, line);
         cout << "\x1b[A" << "\x1b[2K";
+        if(exit_flag) break;
+        
         cout<<" [ YOU ]: "<<line<<endl<<endl;
 
         if (line.rfind("#sendfile ", 0) == 0) {
@@ -110,6 +112,6 @@ int main() {
     if (t_recv.joinable()) t_recv.join();
 
     WSACleanup();
-    cout << "\nDisconnected. Goodbye!\n";
+    cout << "\nSocket closed. Goodbye!\n";
     return 0;
 }
