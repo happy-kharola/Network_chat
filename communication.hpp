@@ -1,6 +1,6 @@
 #pragma once
-// filetransfer.hpp
-// simple file sending and receiving functions for chat program
+// communication.hpp
+// Shared declarations for chat + file transfer functions
 
 #include <string>
 #include <WinSock2.h>

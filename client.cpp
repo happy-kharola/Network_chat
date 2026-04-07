@@ -1,73 +1,141 @@
 // client.cpp
-// simple chat client for the server (supports sending files)
+// LAN chat client with file transfer support
 #include <iostream>
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #include <thread>
 #include <atomic>
 #include <string>
+#include <filesystem>
 #include "communication.hpp"
 
 #pragma comment(lib, "ws2_32.lib")
 using namespace std;
+namespace fs = std::filesystem;
 
-#define PORT 12345
-#define SERVER_IP "10.217.12.117"
+#define DEFAULT_PORT 12345
 
 atomic<bool> exit_flag(false);
 
 bool Initialize() {
     WSADATA data;
-    return WSAStartup(MAKEWORD(2,2), &data) == 0;
+    return WSAStartup(MAKEWORD(2, 2), &data) == 0;
 }
 
-void recv_thread(SOCKET s, string name) {
+
+// -----------------------------------------------------------------------
+// recv_thread — handles all incoming messages from server
+// FIX: server now excludes sender from broadcast, so we no longer
+//      receive our own messages back — double-print is gone
+// -----------------------------------------------------------------------
+
+void recv_thread(SOCKET s, const string& name) {
     string sender, msg;
     while (!exit_flag) {
         if (!recv_frame(s, sender)) break;
-        if (!recv_frame(s, msg)) break;
+        if (!recv_frame(s, msg))   break;
+
+        // File incoming
         if (msg.rfind("#sendfile ", 0) == 0) {
+            cout << "\n";
             recv_file(s, sender, msg.substr(10));
-            continue;  
+            cout << " " << flush;
+            continue;
         }
 
-        else if (sender == "SERVER") cout << "\n## SERVER ## " << msg << endl<<endl;
-        else if (sender == name) cout << "\nYOU: " << msg << endl;
-        else cout <<"[ "<<sender<<" ]" << ": " << msg<<endl<<endl;
+        // Server notification
+        if (sender == "SERVER") {
+            cout << "\n## SERVER ## " << msg << "\n\n";
+        } else {
+            cout << "\n[ " << sender << " ]: " << msg << "\n\n";
+        }
 
         cout << " " << flush;
     }
     exit_flag = true;
 }
 
+
+// -----------------------------------------------------------------------
+// send_thread — handles user input and sends to server
+// -----------------------------------------------------------------------
+
 void send_thread(SOCKET s) {
     string line;
     while (!exit_flag) {
         cout << " " << flush;
         getline(cin, line);
-        cout << "\x1b[A" << "\x1b[2K";
-        if(exit_flag) break;
-        
-        cout<<" [ YOU ]: "<<line<<endl<<endl;
 
+        // Clear the typed line from terminal
+        cout << "\x1b[A" << "\x1b[2K";
+
+        if (exit_flag) break;
+        if (line.empty()) continue;
+
+        // File send
         if (line.rfind("#sendfile ", 0) == 0) {
             string filename = line.substr(10);
+            if (!fs::exists(filename)) {
+                cout << "## File not found: " << filename << "\n\n";
+                continue;
+            }
+            cout << "[ YOU ]: Sending file: " << fs::path(filename).filename().string() << "\n\n";
             send_file(s, filename);
             continue;
         }
 
-        send_frame(s, line);
+        // Exit
         if (line == "#exit") {
+            send_frame(s, "#exit");
             exit_flag = true;
             break;
         }
+
+        // Normal message — print locally then send
+        cout << "[ YOU ]: " << line << "\n\n";
+        send_frame(s, line);
     }
 }
+
+
+// -----------------------------------------------------------------------
+// main
+// -----------------------------------------------------------------------
 
 int main() {
     if (!Initialize()) {
         cout << "Winsock init failed.\n";
         return 1;
+    }
+
+    // NEW: auto-create receivedfiles/ folder on client side
+    fs::create_directories("receivedfiles");
+
+    cout << "\n===============================================\n";
+    cout << "         LAN Chat Client\n";
+    cout << "===============================================\n\n";
+
+    // NEW: ask for server IP at runtime instead of hardcoding it
+    string server_ip;
+    cout << "Enter server IP (ask whoever is running the server): ";
+    getline(cin, server_ip);
+    if (server_ip.empty()) {
+        cout << "No IP entered. Exiting.\n";
+        WSACleanup();
+        return 1;
+    }
+
+    // NEW: optional port override
+    int port = DEFAULT_PORT;
+    cout << "Enter port (press ENTER for default " << DEFAULT_PORT << "): ";
+    string port_input;
+    getline(cin, port_input);
+    if (!port_input.empty()) {
+        try { port = stoi(port_input); }
+        catch (...) {
+            cout << "Invalid port, using default.\n";
+            port = DEFAULT_PORT;
+        }
     }
 
     SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
@@ -77,31 +145,78 @@ int main() {
         return 1;
     }
 
+    // NEW: connection timeout — fail in ~5 seconds instead of hanging for 20+
+    DWORD timeout_ms = 5000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout_ms, sizeof(timeout_ms));
+
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT);
-    inet_pton(AF_INET, SERVER_IP, &addr.sin_addr);
+    addr.sin_port   = htons(port);
 
-    if (connect(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        cout << "Can't connect to server!\n";
+    if (inet_pton(AF_INET, server_ip.c_str(), &addr.sin_addr) != 1) {
+        cout << "Invalid IP address format.\n";
         closesocket(s);
         WSACleanup();
         return 1;
     }
 
-    cout << "\n===============================================" << endl;
-    cout << "         Welcome to the Chat Room!" << endl;
-    cout << "===============================================" << endl;
-    cout << "Type messages normally to chat.\n";
-    cout << "Use '#sendfile <filename>' to send files.\n";
-    cout << "Type '#exit' to leave.\n" << endl;
+    cout << "\nConnecting to " << server_ip << ":" << port << " ...\n";
 
-    cout << "Enter your name: ";
+    if (connect(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        cout << "Could not connect to server!\n";
+        cout << "  - Make sure the server is running.\n";
+        cout << "  - Double-check the IP address.\n";
+        cout << "  - Check that port " << port << " is not blocked by firewall.\n";
+        closesocket(s);
+        WSACleanup();
+        return 1;
+    }
+
+    // Remove the receive timeout after connecting — normal chat has no timeout
+    DWORD no_timeout = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&no_timeout, sizeof(no_timeout));
+
+    cout << "Connected!\n\n";
+
+    // NEW: username negotiation with duplicate rejection
     string name;
-    getline(cin, name);
-    if (name.empty()) name = "Anonymous";
+    while (true) {
+        cout << "Enter your name: ";
+        getline(cin, name);
+        if (name.empty()) name = "Anonymous";
 
-    send_frame(s, name);
+        send_frame(s, name);
+
+        // Wait for server response
+        string resp_sender, resp_msg;
+        if (!recv_frame(s, resp_sender) || !recv_frame(s, resp_msg)) {
+            cout << "Lost connection during name setup.\n";
+            closesocket(s);
+            WSACleanup();
+            return 1;
+        }
+
+        if (resp_msg == "#nameok") {
+            cout << "Name accepted!\n";
+            break;
+        } else if (resp_msg == "#nametaken") {
+            cout << "That name is already taken. Please choose another.\n";
+        } else {
+            // Unexpected message — just proceed
+            break;
+        }
+    }
+
+    cout << "\n===============================================\n";
+    cout << " Welcome, " << name << "!\n";
+    cout << "===============================================\n\n";
+
+    cout << "Commands:\n";
+    cout << "  <message>                  -> Send a message to everyone\n";
+    cout << "  #sendfile <path>           -> Send a file\n";
+    cout << "  #list                      -> See who is online\n";
+    cout << "  #exit                      -> Leave the chat\n";
+    cout << "--------------------------------------------------\n\n";
 
     thread t_recv(recv_thread, s, name);
     thread t_send(send_thread, s);
