@@ -126,17 +126,22 @@ bool send_file(SOCKET s, const string& filename) {
         double sentMB = sent / (1024.0 * 1024.0);
         double sizeMB = size / (1024.0 * 1024.0);
 
-        cout << "\rUploading " << bare << " "
-             << bar << " " << percent << "% "
-             << "(" << fixed << setprecision(2) << sentMB << " MB / "
-             << sizeMB << " MB)" << flush;
-        cout << "\033[F";
+        {
+            lock_guard<mutex> lock(g_cout_mutex);
+            cout << "\rUploading " << bare << " "
+                 << bar << " " << percent << "% "
+                 << "(" << fixed << setprecision(2) << sentMB << " MB / "
+                 << sizeMB << " MB)" << flush;
+            cout << "\033[F";
+        }
     }
 
-    cout << endl << "\n\n Transfer complete: " << bare << endl << endl;
+    {
+        lock_guard<mutex> lock(g_cout_mutex);
+        cout << endl << "\n\n Transfer complete: " << bare << endl << endl;
+    }
     return true;
 }
-
 
 // -----------------------------------------------------------------------
 // recv_file   (reassemble chunks + progress bar)
@@ -155,17 +160,29 @@ bool recv_file(SOCKET s, const string& sender, const string& header) {
 
     fs::create_directories("receivedfiles");
 
-    ofstream out("receivedfiles/received_" + name, ios::binary);
+    string out_path = "receivedfiles/received_" + name;
+    ofstream out(out_path, ios::binary);
     if (!out.is_open()) {
         cerr << "Could not create output file." << endl;
         return false;
     }
 
+    // Apply a receive timeout for just this transfer, so a stalled connection
+    // (dropped Wi-Fi, frozen peer, etc.) can't hang this thread forever.
+    // We save whatever the socket's previous timeout was and restore it after.
+    DWORD prev_timeout = 0;
+    int prev_len = sizeof(prev_timeout);
+    getsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&prev_timeout, &prev_len);
+
+    DWORD transfer_timeout = 15000; // 15s of silence = treat as stalled
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&transfer_timeout, sizeof(transfer_timeout));
+
     long long got = 0;
     string chunk;
+    bool ok = true;
 
     while (got < size) {
-        if (!recv_frame(s, chunk)) break;
+        if (!recv_frame(s, chunk)) { ok = false; break; }
         out.write(chunk.c_str(), chunk.size());
         got += chunk.size();
 
@@ -177,15 +194,31 @@ bool recv_file(SOCKET s, const string& sender, const string& header) {
         double gotMB  = got  / (1024.0 * 1024.0);
         double sizeMB = size / (1024.0 * 1024.0);
 
-        cout << "\rReceiving " << name << " from " << sender << " "
-             << bar << " " << percent << "% "
-             << "(" << fixed << setprecision(2) << gotMB << " MB / "
-             << sizeMB << " MB)" << flush;
-        cout << "\033[F";
+        {
+            lock_guard<mutex> lock(g_cout_mutex);
+            cout << "\rReceiving " << name << " from " << sender << " "
+                 << bar << " " << percent << "% "
+                 << "(" << fixed << setprecision(2) << gotMB << " MB / "
+                 << sizeMB << " MB)" << flush;
+            cout << "\033[F";
+        }
+    }
+
+    out.close();
+
+    // Restore whatever timeout was set before this transfer started.
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&prev_timeout, sizeof(prev_timeout));
+
+    lock_guard<mutex> lock(g_cout_mutex);
+    if (!ok) {
+        fs::remove(out_path); // don't leave a corrupt partial file lying around
+        cout << "\nTransfer failed or timed out — connection stalled.\n";
+        cout << "Partial file discarded.\n\n";
+        return false;
     }
 
     cout << "\nTransfer complete.\n";
-    cout << "Saved: receivedfiles/received_" << name << "\n\n";
+    cout << "Saved: " << out_path << "\n\n";
     cout << "--------------------------------------------------\n";
 
     return true;

@@ -9,6 +9,8 @@
 #include <mutex>
 #include <algorithm>
 #include <filesystem>
+#include <memory>
+#include <atomic>
 #include "communication.hpp"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -61,10 +63,14 @@ struct Client {
     string name;
     SOCKET sock;
     thread th;
+    mutex  send_mtx;   // guards writes to this client's socket
+    atomic<bool> ready{false};   // true only once username negotiation succeeds
+
 };
 
-vector<Client> clients;
-mutex mtx_cout, mtx_clients;
+vector<shared_ptr<Client>> clients;
+mutex g_cout_mutex;   // the one definition of the shared cout mutex for this program
+mutex mtx_clients;
 int next_id = 1;
 
 
@@ -73,7 +79,7 @@ int next_id = 1;
 // -----------------------------------------------------------------------
 
 void print_safe(const string& msg) {
-    lock_guard<mutex> lock(mtx_cout);
+    lock_guard<mutex> lock(g_cout_mutex);
     cout << msg << endl;
 }
 
@@ -100,52 +106,87 @@ string get_local_ip() {
 }
 
 // Broadcast a message to all connected clients, optionally excluding one socket
-void broadcast(const string& sender, const string& msg, SOCKET exclude = INVALID_SOCKET) {
-    lock_guard<mutex> lock(mtx_clients);
-    for (auto& c : clients) {
-        if (c.sock == exclude) continue;
-        send_frame(c.sock, sender);
-        send_frame(c.sock, msg);
-    }
+// Sends one chat frame (sender + msg) to a client, serialized per-socket.
+void send_to_client(const shared_ptr<Client>& c, const string& sender, const string& msg) {
+    lock_guard<mutex> lock(c->send_mtx);
+    send_frame(c->sock, sender);
+    send_frame(c->sock, msg);
 }
+
+// Sends "sender" plus a full file transfer to a client, serialized per-socket —
+// the lock is held for the whole transfer so nothing else can interleave with it.
+void send_file_from(const shared_ptr<Client>& c, const string& sender, const string& filepath) {
+    lock_guard<mutex> lock(c->send_mtx);
+    send_frame(c->sock, sender);
+    send_file(c->sock, filepath);
+}
+
+// Broadcast a message to all connected clients, optionally excluding one socket
+void broadcast(const string& sender, const string& msg, SOCKET exclude = INVALID_SOCKET) {
+    vector<shared_ptr<Client>> targets;
+    {
+        lock_guard<mutex> lock(mtx_clients);
+        for (auto& c : clients)
+            if (c->sock != exclude && c->ready) targets.push_back(c);
+    }
+    for (auto& c : targets)
+        send_to_client(c, sender, msg);
+}
+
+// Looks up a client by socket. Caller must not be holding mtx_clients.
+shared_ptr<Client> find_client(SOCKET s) {
+    lock_guard<mutex> lock(mtx_clients);
+    for (auto& c : clients)
+        if (c->sock == s) return c;
+    return nullptr;
+}
+
 
 // Returns true if the given username is already registered (call without holding mtx_clients)
 bool name_taken(const string& name) {
     for (auto& c : clients)
-        if (c.name == name) return true;
+        if (c->name == name) return true;
     return false;
 }
 
 // Cleanly removes a client from the list and closes its socket
 void remove_client(SOCKET s) {
-    lock_guard<mutex> lock(mtx_clients);
-    auto it = find_if(clients.begin(), clients.end(), [&](Client& c) { return c.sock == s; });
-    if (it != clients.end()) {
-        shutdown(s, SD_SEND);
-        closesocket(it->sock);
-        if (it->th.joinable()) it->th.detach();
-        clients.erase(it);
+    shared_ptr<Client> target;
+    {
+        lock_guard<mutex> lock(mtx_clients);
+        auto it = find_if(clients.begin(), clients.end(),
+                           [&](shared_ptr<Client>& c) { return c->sock == s; });
+        if (it != clients.end()) {
+            target = *it;
+            clients.erase(it);
+        }
+    }
+
+    if (target) {
+        lock_guard<mutex> lock(target->send_mtx); // wait out any in-flight send before closing
+        shutdown(target->sock, SD_SEND);
+        closesocket(target->sock);
+        if (target->th.joinable()) target->th.detach();
     }
 }
 
 // Disconnects a client by name — collects socket first, releases lock before acting
 // to avoid deadlock with remove_client and broadcast
 void kick_user(const string& name) {
-    SOCKET target = INVALID_SOCKET;
+    shared_ptr<Client> target;
     {
         lock_guard<mutex> lock(mtx_clients);
         for (auto& c : clients)
-            if (c.name == name) { target = c.sock; break; }
+            if (c->name == name) { target = c; break; }
     }
 
-    if (target == INVALID_SOCKET) {
+    if (!target) {
         print_safe("[Server] No connected user named '" + name + "'.");
         return;
     }
 
-    send_frame(target, "SERVER");
-    send_frame(target, "You have been disconnected by the server.");
-    remove_client(target);
+    send_to_client(target, "SERVER", "You have been disconnected by the server.");
+    remove_client(target->sock);
     broadcast("SERVER", name + " was disconnected by the server.");
     print_safe("[Server] Kicked: " + name);
 }
@@ -160,12 +201,12 @@ void send_user_list(SOCKET s) {
     {
         lock_guard<mutex> lock(mtx_clients);
         for (size_t i = 0; i < clients.size(); i++) {
-            list += clients[i].name;
+            list += clients[i]->name;
             if (i + 1 < clients.size()) list += ", ";
         }
     }
-    send_frame(s, "SERVER");
-    send_frame(s, list);
+    auto self = find_client(s);
+    if (self) send_to_client(self, "SERVER", list);
 }
 
 
@@ -184,17 +225,15 @@ void forward_last_file() {
 
     print_safe("[Server] Forwarding: " + name + " (originally from " + sender + ")");
 
-    vector<SOCKET> targets;
+    vector<shared_ptr<Client>> targets;
     {
         lock_guard<mutex> lock(mtx_clients);
         for (auto& c : clients)
-            if (c.name != sender) targets.push_back(c.sock);
+            if (c->name != sender) targets.push_back(c);
     }
 
-    for (SOCKET sock : targets) {
-        send_frame(sock, "SERVER");
-        send_file(sock, path);
-    }
+    for (auto& c : targets)
+        send_file_from(c, "SERVER", path);
 
     broadcast("SERVER", "Server forwarded file: " + name);
 }
@@ -213,11 +252,11 @@ void server_send_file_all(const string& filepath) {
     string bare = fs::path(filepath).filename().string();
     print_safe("[Server] Sending " + bare + " to all connected clients...");
 
-    vector<SOCKET> targets;
+    vector<shared_ptr<Client>> targets;
     {
         lock_guard<mutex> lock(mtx_clients);
         for (auto& c : clients)
-            targets.push_back(c.sock);
+            targets.push_back(c);
     }
 
     if (targets.empty()) {
@@ -225,10 +264,8 @@ void server_send_file_all(const string& filepath) {
         return;
     }
 
-    for (SOCKET sock : targets) {
-        send_frame(sock, "SERVER");
-        send_file(sock, filepath);
-    }
+    for (auto& c : targets)
+        send_file_from(c, "SERVER", filepath);
 
     broadcast("SERVER", "Server distributed file: " + bare);
     print_safe("[Server] File sent to all clients: " + bare);
@@ -245,14 +282,14 @@ void server_send_file_one(const string& target_name, const string& filepath) {
         return;
     }
 
-    SOCKET target = INVALID_SOCKET;
+    shared_ptr<Client> target;
     {
         lock_guard<mutex> lock(mtx_clients);
         for (auto& c : clients)
-            if (c.name == target_name) { target = c.sock; break; }
+            if (c->name == target_name) { target = c; break; }
     }
 
-    if (target == INVALID_SOCKET) {
+    if (!target) {
         print_safe("[Server] No connected user named '" + target_name + "'.");
         return;
     }
@@ -260,8 +297,7 @@ void server_send_file_one(const string& target_name, const string& filepath) {
     string bare = fs::path(filepath).filename().string();
     print_safe("[Server] Sending " + bare + " to " + target_name + "...");
 
-    send_frame(target, "SERVER");
-    send_file(target, filepath);
+    send_file_from(target, "SERVER", filepath);
 
     print_safe("[Server] File sent to " + target_name + ": " + bare);
 }
@@ -298,7 +334,7 @@ void client_handler(SOCKET s, int id) {
     {
         lock_guard<mutex> lock(mtx_clients);
         for (auto& c : clients)
-            if (c.sock == s) c.name = name;
+            if (c->sock == s) { c->name = name; c->ready = true; }
     }
 
     print_safe("[+] " + name + " connected  (id=" + to_string(id) + ")");
@@ -458,7 +494,7 @@ int main() {
                 } else {
                     cout << "[Server] Connected (" << clients.size() << "): ";
                     for (size_t i = 0; i < clients.size(); i++) {
-                        cout << clients[i].name;
+                        cout << clients[i]->name;
                         if (i + 1 < clients.size()) cout << ", ";
                     }
                     cout << "\n";
@@ -484,9 +520,9 @@ int main() {
                     {
                         lock_guard<mutex> lock(mtx_clients);
                         for (auto& c : clients) {
-                            if (c.name == first_word) {
-                                found_sock = c.sock;
-                                found_name = c.name;
+                            if (c->name == first_word) {
+                                found_sock = c->sock;
+                                found_name = c->name;
                                 remainder  = rest;
                                 break;
                             }
@@ -516,12 +552,17 @@ int main() {
         if (clientSock == INVALID_SOCKET) continue;
 
         int id = next_id++;
+        auto client = make_shared<Client>();
+        client->id   = id;
+        client->name = "Anonymous";
+        client->sock = clientSock;
+
         {
             lock_guard<mutex> lock(mtx_clients);
-            clients.push_back({id, "Anonymous", clientSock, thread()});
-            clients.back().th = thread(client_handler, clientSock, id);
-            clients.back().th.detach();
+            clients.push_back(client);
         }
+        client->th = thread(client_handler, clientSock, id);
+        client->th.detach();
     }
 
     closesocket(listenSock);

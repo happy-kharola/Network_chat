@@ -8,6 +8,8 @@
 #include <string>
 #include <filesystem>
 #include "communication.hpp"
+#include <mutex>
+
 
 #pragma comment(lib, "ws2_32.lib")
 using namespace std;
@@ -15,7 +17,9 @@ namespace fs = std::filesystem;
 
 #define DEFAULT_PORT 12345
 
+
 atomic<bool> exit_flag(false);
+mutex g_cout_mutex;   // the one definition of the shared cout mutex for this program
 
 bool Initialize() {
     WSADATA data;
@@ -35,19 +39,27 @@ void recv_thread(SOCKET s, const string& name) {
         if (!recv_frame(s, msg))   break;
 
         if (msg.rfind("#sendfile ", 0) == 0) {
-            cout << "\n";
+            {
+                lock_guard<mutex> lock(g_cout_mutex);
+                cout << "\n";
+            }
             recv_file(s, sender, msg.substr(10));
-            cout << " " << flush;
+            {
+                lock_guard<mutex> lock(g_cout_mutex);
+                cout << " " << flush;
+            }
             continue;
         }
 
-        if (sender == "SERVER") {
-            cout << "\n[SERVER] " << msg << "\n\n";
-        } else {
-            cout << "\n[ " << sender << " ]: " << msg << "\n\n";
+        {
+            lock_guard<mutex> lock(g_cout_mutex);
+            if (sender == "SERVER") {
+                cout << "\n[SERVER] " << msg << "\n\n";
+            } else {
+                cout << "\n[ " << sender << " ]: " << msg << "\n\n";
+            }
+            cout << " " << flush;
         }
-
-        cout << " " << flush;
     }
     exit_flag = true;
 }
@@ -60,9 +72,15 @@ void recv_thread(SOCKET s, const string& name) {
 void send_thread(SOCKET s) {
     string line;
     while (!exit_flag) {
-        cout << " " << flush;
+        {
+            lock_guard<mutex> lock(g_cout_mutex);
+            cout << " " << flush;
+        }
         getline(cin, line);
-        cout << "\x1b[A" << "\x1b[2K";
+        {
+            lock_guard<mutex> lock(g_cout_mutex);
+            cout << "\x1b[A" << "\x1b[2K";
+        }
 
         if (exit_flag) break;
         if (line.empty()) continue;
@@ -70,10 +88,14 @@ void send_thread(SOCKET s) {
         if (line.rfind("#sendfile ", 0) == 0) {
             string filename = line.substr(10);
             if (!fs::exists(filename)) {
+                lock_guard<mutex> lock(g_cout_mutex);
                 cout << "[Error] File not found: " << filename << "\n\n";
                 continue;
             }
-            cout << "[ YOU ]: Sending file: " << fs::path(filename).filename().string() << "\n\n";
+            {
+                lock_guard<mutex> lock(g_cout_mutex);
+                cout << "[ YOU ]: Sending file: " << fs::path(filename).filename().string() << "\n\n";
+            }
             send_file(s, filename);
             continue;
         }
@@ -84,7 +106,10 @@ void send_thread(SOCKET s) {
             break;
         }
 
-        cout << "[ YOU ]: " << line << "\n\n";
+        {
+            lock_guard<mutex> lock(g_cout_mutex);
+            cout << "[ YOU ]: " << line << "\n\n";
+        }
         send_frame(s, line);
     }
 }
